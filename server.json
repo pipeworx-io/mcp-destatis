@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/destatis",
   "title": "Destatis",
   "description": "Destatis MCP — Germany's official statistics (Destatis GENESIS-Online).",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "websiteUrl": "https://pipeworx.io/packs/destatis",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-destatis",
