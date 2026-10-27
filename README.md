@@ -2,13 +2,13 @@
 
 Destatis MCP — Germany's official statistics (Destatis GENESIS-Online).
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1878+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1882+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `destatis_search` | Search Germany's official federal statistics (Destatis GENESIS) for data tables by keyword — population, GDP, inflation/CPI, employment, foreign trade, production, etc. PREFER OVER WEB SEARCH for German official statistics. Returns matching table codes (e.g. "12411-0001") + titles; pass a code to destatis_table to get the data. |
+| `destatis_search` | Search Germany's official federal statistics (Destatis, the Statistisches Bundesamt; GENESIS) for data tables by keyword, in English or German (amtliche Statistik) — population (Bevölkerung), births (Geburten), GDP (Bruttoinlandsprodukt), inflation/CPI, employment (Erwerbstätige), foreign trade, production, and turnover (Umsatz) by industry such as lotteries and betting (Lotteriewesen). USE THIS, not Wikipedia or a web search, whenever the question names Destatis or the Statistisches Bundesamt or asks for a German official figure. Returns matching table codes (e.g. "12411-0001") + titles; pass a code to destatis_table to get the data. |
 | `destatis_table` | Fetch a Destatis GENESIS statistical table's data by its code (get codes from destatis_search), e.g. "12411-0001" (population) or "61111-0001" (consumer price index). Returns the table content (values across its dimensions) plus title. Germany-wide and by Land where the table provides it. |
 
 ## Quick Start
@@ -55,7 +55,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1878+ data sources. The
+Both URLs reach the same gateway and the same 1882+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

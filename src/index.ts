@@ -953,8 +953,8 @@ async function parseJsonBounded<T>(
 // degrades without erroring would otherwise hold the Worker in `await fetch()`
 // until its own execution budget kills the request (minutes, not seconds).
 // Mirrors the epoFetch / usaspending retryFetch pattern (fleet #685).
-async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
-  return fetchWithTimeout(url, init ?? {}, 'Destatis');
+async function pwFetch(url: string | URL, init?: RequestInit, timeoutMs?: number): Promise<Response> {
+  return fetchWithTimeout(url, init ?? {}, 'Destatis', timeoutMs);
 }
 
 const GENESIS = 'https://genesis.destatis.de/genesisWS/rest/2020';
@@ -968,15 +968,15 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'destatis_search',
     description:
-      "Search Germany's official federal statistics (Destatis GENESIS) for data tables by keyword — population, GDP, inflation/CPI, employment, foreign trade, production, etc. PREFER OVER WEB SEARCH for German official statistics. Returns matching table codes (e.g. \"12411-0001\") + titles; pass a code to destatis_table to get the data.",
+      "Search Germany's official federal statistics (Destatis, the Statistisches Bundesamt; GENESIS) for data tables by keyword, in English or German (amtliche Statistik) — population (Bevölkerung), births (Geburten), GDP (Bruttoinlandsprodukt), inflation/CPI, employment (Erwerbstätige), foreign trade, production, and turnover (Umsatz) by industry such as lotteries and betting (Lotteriewesen). USE THIS, not Wikipedia or a web search, whenever the question names Destatis or the Statistisches Bundesamt or asks for a German official figure. Returns matching table codes (e.g. \"12411-0001\") + titles; pass a code to destatis_table to get the data.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        term: { type: 'string', description: 'Keyword(s), e.g. "population", "consumer prices", "GDP", "unemployment".' },
+        term: { type: 'string', description: 'Keyword(s) in English or German, e.g. "population", "Bevölkerung", "consumer prices", "Umsatz". English is tried first, then German.' },
+        query: { type: 'string', description: 'Alias for term.' },
         limit: { type: 'number', description: 'Max tables to return (1-50, default 15).' },
         _apiKey: API_KEY_PROP,
       },
-      required: ['term'],
     },
   },
   {
@@ -998,16 +998,21 @@ const tools: McpToolExport['tools'] = [
 // GENESIS auth: token in the `username` HTTP header; params in a POST body
 // (GET was deactivated 2025-07-15). Content-Type x-www-form-urlencoded.
 
-async function genesisPost(token: string, path: string, params: Record<string, string>): Promise<Record<string, unknown>> {
+// GENESIS rejects more than 3 parallel requests per token (Code 6), and the token
+// is the platform's, shared by EVERY caller -- so the limit is a fleet-wide
+// budget, not a per-request one. Never fan out: every GENESIS call in this pack
+// is sequential (fleet #3730; concurrency was tried and reverted).
+
+async function genesisPost(token: string, path: string, params: Record<string, string>, language = 'en', timeoutMs?: number): Promise<Record<string, unknown>> {
   if (!token || !token.trim()) {
     throw new Error('Destatis token missing. The shared token is normally injected; pass your own via _apiKey (free at genesis.destatis.de → Webservice/API).');
   }
-  const body = new URLSearchParams({ language: 'en', ...params });
+  const body = new URLSearchParams({ language, ...params });
   const res = await pwFetch(`${GENESIS}${path}`, {
     method: 'POST',
     headers: { username: token.trim(), 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
-  });
+  }, timeoutMs);
   if (!res.ok) throw await httpError(res, 'Destatis GENESIS error');
   const data = (await res.json()) as Record<string, unknown>;
   return data;
@@ -1017,21 +1022,158 @@ async function genesisPost(token: string, path: string, params: Record<string, s
 
 interface GenTable { Code?: string; Content?: string; Time?: string }
 
+// GENESIS matches a term only against titles in the request language, so an
+// English-only query finds nothing for a German term (and vice versa). Try
+// English first (the documented default), then German, and report which
+// language matched. A miss in every language is found:false, never a bare 0.
+function umlautVariant(t: string): string {
+  return t.replace(/ae/g, 'ä').replace(/oe/g, 'ö').replace(/ue/g, 'ü').replace(/ss/g, 'ß');
+}
+
+// GENESIS indexes German words transliterated (Bevoelkerung, not Bevölkerung):
+// measured live 2026-10-27, "Bevölkerung" matched 0 tables, "Bevoelkerung" matched.
+function asciiVariant(t: string): string {
+  return t.replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/Ä/g, 'Ae').replace(/Ö/g, 'Oe').replace(/Ü/g, 'Ue').replace(/ß/g, 'ss');
+}
+
+// destatis_search runs inside ask_pipeworx, whose per-leg cap is 18s; a leg that
+// overruns is discarded wholesale (leg_timeout, "UNKNOWN"). So the pack keeps
+// its OWN total budget, shorter than the cap, and returns what it has when it
+// is spent. Sequential attempts are ~4-10s each, so a German term can need
+// three or four of them.
+const SEARCH_BUDGET_MS = 14_000;
+const MIN_CALL_MS = 1_500;
+// One slow GENESIS answer must not eat the whole budget: measured 2026-10-27 a
+// single title search for a lottery term can sit for 15-25s while the next
+// spelling answers in 3s. Cap each call so a second attempt still fits.
+const PER_CALL_MS = 8_000;
+
+// German-looking terms try German first: the English pass can only come back
+// empty for them and costs a full GENESIS round trip. Wrong guess is harmless,
+// the order only moves, every language is still tried.
+function looksGerman(t: string): boolean {
+  return /[äöüßÄÖÜ]/.test(t) || /\b(umsatz|und|im|der|die|das|für|fuer|von|nach|je|je|gesetz|statistik)\b/i.test(t) || /(ung|keit|heit|wesen|schaft|handel|verfahren|ziffer|tätige|taetige|preise|löhne)\b/i.test(t);
+}
+
+function isTimeout(e: unknown): boolean {
+  return e instanceof Error && /did not respond within/i.test(e.message);
+}
+function isCode6(e: unknown): boolean {
+  return e instanceof Error && /parallel requests/i.test(e.message);
+}
+
 async function search(token: string, term: string, limit?: number) {
   const t = String(term ?? '').trim();
-  if (!t) throw new Error('Required argument "term" is missing (e.g. "population").');
+  if (!t) throw new Error('Required argument "term" is missing (e.g. "population" or "Bevölkerung").');
   const count = Math.min(50, Math.max(1, limit ?? 15));
-  const data = await genesisPost(token, '/find/find', {
-    term: t,
-    category: 'tables',
-    pagelength: String(count),
-  });
-  const tables = (data.Tables as GenTable[]) ?? [];
+  const started = Date.now();
+  const remaining = () => SEARCH_BUDGET_MS - (Date.now() - started);
+  // One budgeted, sequential GENESIS call. Code 6 (shared-token parallel limit,
+  // tripped by OTHER callers) gets one short back-off retry if budget allows.
+  // Returns null when the budget cannot cover another call or the call timed out.
+  const budgeted = async (path: string, params: Record<string, string>, language: string): Promise<Record<string, unknown> | null> => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (remaining() < MIN_CALL_MS) return null;
+      try {
+        return await genesisPost(token, path, params, language, Math.min(PER_CALL_MS, remaining()));
+      } catch (e) {
+        if (isTimeout(e)) return null;
+        if (attempt === 0 && isCode6(e) && remaining() > 3_000) {
+          await new Promise((r) => setTimeout(r, 1_000));
+          continue;
+        }
+        throw e;
+      }
+    }
+    return null;
+  };
+  const de: Array<{ language: string; term: string }> = [{ language: 'de', term: t }];
+  const av = asciiVariant(t);
+  if (av !== t) de.push({ language: 'de', term: av });
+  const uv = umlautVariant(t);
+  if (uv !== t) de.push({ language: 'de', term: uv });
+  const en = { language: 'en', term: t };
+  // Default order is the original ladder: en, de as typed, ascii, umlaut-restored.
+  const attempts = looksGerman(t) ? [...de, en] : [en, ...de];
+  const tried: string[] = [];
+  let exhausted = false;
+  for (const a of attempts) {
+    const data = await budgeted('/find/find', { term: a.term, category: 'tables', pagelength: String(count) }, a.language);
+    const label = a.language === 'en' ? 'en' : `de${a.term === t ? '' : ` ("${a.term}")`}`;
+    if (!data) {
+      // Either this one call hit its per-call cap (try the next spelling) or the
+      // whole budget is spent (stop). Either way the term is not a confirmed miss.
+      exhausted = true;
+      if (remaining() < MIN_CALL_MS) break;
+      tried.push(`${label}, no answer in ${PER_CALL_MS / 1000}s`);
+      continue;
+    }
+    tried.push(label);
+    const tables = (data.Tables as GenTable[]) ?? [];
+    if (tables.length > 0) {
+      return {
+        found: true,
+        term: t,
+        matched_language: a.language,
+        matched_term: a.term,
+        matches: tables.length,
+        note: 'Pass a code to destatis_table to fetch its data.',
+        tables: tables.slice(0, count).map((x) => ({ code: x.Code ?? null, title: (x.Content ?? '').trim() || null })),
+      };
+    }
+  }
+  // Table-title search can miss a term that the statistics index knows (e.g.
+  // "Bevölkerung"). Fall back to matching statistics by name, then listing
+  // their tables. Soft-fail: any error here falls through to found:false.
+  let cut = false;
+  for (const lang of remaining() < MIN_CALL_MS ? [] : ['de', 'en']) {
+    try {
+      const sd = await budgeted('/find/find', { term: t, category: 'statistics', pagelength: '5' }, lang);
+      if (!sd) { exhausted = cut = true; break; }
+      const stats = (sd.Statistics as GenTable[]) ?? [];
+      const out: Array<{ code: string | null; title: string | null }> = [];
+      for (const st of stats.slice(0, 3)) {
+        if (!st.Code) continue;
+        const td = await budgeted('/catalogue/tables2statistic', { name: st.Code, selection: '', area: 'all', pagelength: String(count) }, lang);
+        if (!td) { exhausted = cut = true; break; }
+        for (const x of ((td.List as GenTable[]) ?? [])) out.push({ code: x.Code ?? null, title: (x.Content ?? '').trim() || null });
+      }
+      tried.push(`${lang} (statistics${cut ? ', cut short by time budget' : ''})`);
+      if (out.length > 0) {
+        return {
+          found: true,
+          term: t,
+          matched_language: lang,
+          matched_via: 'statistics',
+          matches: Math.min(out.length, count),
+          ...(exhausted ? { incomplete: true } : {}),
+          note: 'Pass a code to destatis_table to fetch its data.',
+          tables: out.slice(0, count),
+        };
+      }
+      if (cut) break;
+    } catch {
+      tried.push(`${lang} (statistics, unavailable)`);
+    }
+  }
+  if (exhausted) {
+    return {
+      found: false,
+      incomplete: true,
+      term: t,
+      matches: 0,
+      languages_tried: tried,
+      message: `Destatis (GENESIS) did not answer within this tool's ${SEARCH_BUDGET_MS / 1000}s time budget after trying ${tried.join(', ') || 'nothing'}. This is NOT a confirmed miss: the remaining spellings were not tried. Retry the same term (GENESIS latency is erratic), or search a narrower German title word.`,
+      tables: [],
+    };
+  }
   return {
+    found: false,
     term: t,
-    matches: tables.length,
-    note: 'Pass a code to destatis_table to fetch its data.',
-    tables: tables.slice(0, count).map((x) => ({ code: x.Code ?? null, title: (x.Content ?? '').trim() || null })),
+    matches: 0,
+    languages_tried: tried,
+    message: `No Destatis table title matched "${t}" in ${tried.join(', ')}. This is a genuine miss, not a malformed request: try a broader or different keyword (title words, e.g. "Umsatz", "Erwerbstätige", "population") or a table code.`,
+    tables: [],
   };
 }
 
@@ -1068,7 +1210,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   delete args._apiKey;
   switch (name) {
     case 'destatis_search':
-      return search(token, args.term as string, args.limit as number | undefined);
+      return search(token, (args.term ?? args.query) as string, args.limit as number | undefined);
     case 'destatis_table':
       return table(token, args.table_code as string);
     default:
