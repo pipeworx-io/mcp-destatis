@@ -1043,11 +1043,6 @@ function asciiVariant(t: string): string {
 // three or four of them.
 const SEARCH_BUDGET_MS = 14_000;
 const MIN_CALL_MS = 1_500;
-// One slow GENESIS answer must not eat the whole budget: measured 2026-10-27 a
-// single title search for a lottery term can sit for 15-25s while the next
-// spelling answers in 3s. Cap each call so a second attempt still fits.
-const PER_CALL_MS = 8_000;
-
 // German-looking terms try German first: the English pass can only come back
 // empty for them and costs a full GENESIS round trip. Wrong guess is harmless,
 // the order only moves, every language is still tried.
@@ -1075,7 +1070,7 @@ async function search(token: string, term: string, limit?: number) {
     for (let attempt = 0; attempt < 2; attempt++) {
       if (remaining() < MIN_CALL_MS) return null;
       try {
-        return await genesisPost(token, path, params, language, Math.min(PER_CALL_MS, remaining()));
+        return await genesisPost(token, path, params, language, remaining());
       } catch (e) {
         if (isTimeout(e)) return null;
         if (attempt === 0 && isCode6(e) && remaining() > 3_000) {
@@ -1101,12 +1096,10 @@ async function search(token: string, term: string, limit?: number) {
     const data = await budgeted('/find/find', { term: a.term, category: 'tables', pagelength: String(count) }, a.language);
     const label = a.language === 'en' ? 'en' : `de${a.term === t ? '' : ` ("${a.term}")`}`;
     if (!data) {
-      // Either this one call hit its per-call cap (try the next spelling) or the
-      // whole budget is spent (stop). Either way the term is not a confirmed miss.
+      // The budget is spent (the call that was in flight timed out). Not a confirmed miss.
       exhausted = true;
-      if (remaining() < MIN_CALL_MS) break;
-      tried.push(`${label}, no answer in ${PER_CALL_MS / 1000}s`);
-      continue;
+      tried.push(`${label}, no answer in time`);
+      break;
     }
     tried.push(label);
     const tables = (data.Tables as GenTable[]) ?? [];
