@@ -948,6 +948,8 @@ async function parseJsonBounded<T>(
  * - destatis_table:  fetch a table's data by its code
  */
 
+import { INDEX, INDEX_AS_OF } from './table-index.js';
+import { HEADLINES, HEADLINES_AS_OF } from './headline-figures.js';
 
 // Bound every fetch() in this pack to a fixed timeout — an upstream that
 // degrades without erroring would otherwise hold the Worker in `await fetch()`
@@ -968,7 +970,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'destatis_search',
     description:
-      "Search Germany's official federal statistics (Destatis, the Statistisches Bundesamt; GENESIS) for data tables by keyword, in English or German (amtliche Statistik) — population (Bevölkerung), births (Geburten), GDP (Bruttoinlandsprodukt), inflation/CPI, employment (Erwerbstätige), foreign trade, production, and turnover (Umsatz) by industry such as lotteries and betting (Lotteriewesen). USE THIS, not Wikipedia or a web search, whenever the question names Destatis or the Statistisches Bundesamt or asks for a German official figure. Returns matching table codes (e.g. \"12411-0001\") + titles; pass a code to destatis_table to get the data.",
+      "Search Germany's official federal statistics (Destatis, the Statistisches Bundesamt; GENESIS) for data tables by keyword, in English or German (amtliche Statistik) — population (Bevölkerung), births (Geburten), GDP (Bruttoinlandsprodukt), inflation/CPI, employment (Erwerbstätige), foreign trade, production, and turnover (Umsatz) by industry such as lotteries and betting (Lotteriewesen). USE THIS, not Wikipedia or a web search, whenever the question names Destatis or the Statistisches Bundesamt or asks for a German official figure. Common topics (lotteries and betting, insolvencies, population, births, deaths, employment, prices, GDP, trade, production, retail, tourism, earnings) are answered instantly from a curated table index with a data_as_of date; other terms go to a live title search, which is slow for full sentences, so pass key words. Returns matching table codes (e.g. \"12411-0001\") + titles; pass a code to destatis_table to get the data.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -982,11 +984,21 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'destatis_table',
     description:
-      "Fetch a Destatis GENESIS statistical table's data by its code (get codes from destatis_search), e.g. \"12411-0001\" (population) or \"61111-0001\" (consumer price index). Returns the table content (values across its dimensions) plus title. Germany-wide and by Land where the table provides it.",
+      "Fetch a Destatis GENESIS statistical table's data by its code (get codes from destatis_search), e.g. \"12411-0001\" (population) or \"61111-0001\" (consumer price index). Returns the table content (values across its dimensions) plus title. Germany-wide and by Land where the table provides it. A table can offer only a coarse level (e.g. 48112-0001 is WZ sections A-S only; the 4-digit industry rows are in the sibling 48112-0002): call with structure:true to see its dimensions, then filter with classifying_key1 (e.g. WZ08-9200 for gambling and betting) and start_year/end_year. A filtered call takes 12-20s.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         table_code: { type: 'string', description: 'GENESIS table code, e.g. "12411-0001".' },
+        structure: { type: 'boolean', description: 'true = return the table\'s dimensions (variables, time range, classification levels) instead of data. Use it to learn which classification keys a table offers before filtering.' },
+        classifying_key1: { type: 'string', description: 'Filter the table\'s 1st classifying variable to these keys (comma-separated, e.g. "WZ08-92" for lotteries/betting in an industry table). Without a filter GENESIS may return only the top level (e.g. WZ sections).' },
+        classifying_key2: { type: 'string', description: 'Same, 2nd classifying variable.' },
+        classifying_key3: { type: 'string', description: 'Same, 3rd classifying variable.' },
+        classifying_variable1: { type: 'string', description: 'Name of the 1st classifying variable (from structure:true), e.g. "WZ08". Optional.' },
+        classifying_variable2: { type: 'string', description: 'Name of the 2nd classifying variable. Optional.' },
+        classifying_variable3: { type: 'string', description: 'Name of the 3rd classifying variable. Optional.' },
+        start_year: { type: 'string', description: 'First year, e.g. "2022".' },
+        end_year: { type: 'string', description: 'Last year, e.g. "2024".' },
+        area: { type: 'string', description: 'GENESIS area: free (default), public, all, user.' },
         _apiKey: API_KEY_PROP,
       },
       required: ['table_code'],
@@ -1057,10 +1069,91 @@ function isCode6(e: unknown): boolean {
   return e instanceof Error && /parallel requests/i.test(e.message);
 }
 
+// ── Curated table-code index (fleet #3732) ───────────────────────────
+// GENESIS's own title search is slow and erratic: a full German sentence, or a
+// term it matches nothing for, can take longer than this tool's whole budget, and
+// an aborted call keeps counting against the shared token's parallel limit
+// (Code 6 on the next caller). So common topics are answered from a small
+// curated index (table-index.ts, regenerated by scripts/refresh-destatis-index.mjs)
+// with NO GENESIS call at all. Only a term the index does not know goes live.
+
+// Fold to the transliterated ASCII GENESIS itself indexes, drop remaining accents.
+function fold(t: string): string {
+  return asciiVariant(t).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+function keywordHits(folded: string, tokens: string[], kw: string): boolean {
+  if (kw.includes(' ')) return folded.includes(kw);
+  if (kw.length <= 4) return tokens.includes(kw);
+  return tokens.some((tok) => {
+    if (tok === kw) return true;
+    if (kw.length >= 8 && tok.includes(kw)) return true; // Unternehmensinsolvenzen ~ insolvenz
+    return tok.startsWith(kw) && tok.length - kw.length <= 2; // plural/inflection, not "important" ~ "import"
+  });
+}
+
+function lookupIndex(term: string, count: number) {
+  const folded = fold(term);
+  const tokens = folded.split(/[^a-z0-9]+/).filter(Boolean);
+  const ranked = INDEX
+    .map((topic, order) => ({ topic, order, hits: topic.keywords.filter((k) => keywordHits(folded, tokens, k)).length }))
+    .filter((x) => x.hits > 0)
+    .sort((a, b) => b.hits - a.hits || a.order - b.order)
+    .slice(0, 3);
+  if (ranked.length === 0) return null;
+  const seen = new Set<string>();
+  const tables: Array<{ code: string; title: string }> = [];
+  for (const r of ranked) {
+    for (const x of r.topic.tables) {
+      if (!seen.has(x.code)) { seen.add(x.code); tables.push(x); }
+    }
+  }
+  // Headline figure for the topic (fleet #3748): a GENESIS data call takes 12-20s,
+  // longer than one ask_pipeworx leg, so the figure the caller usually means is
+  // carried here as a dated copy, with the live call that reproduces it.
+  const figures = HEADLINES.filter((h) => ranked.some((r) => r.topic.id === h.topic)).map((h) => ({
+    table_code: h.table_code,
+    row: `${h.row_key} ${h.row_label}`,
+    scope: h.scope_note,
+    measures: h.measures,
+    values_by_year: h.years,
+    symbols: 'Values are as GENESIS prints them; "-" means nothing to report / not published for that year (NOT zero), "." means not available.',
+    data_as_of: HEADLINES_AS_OF,
+    source: 'Destatis (Statistisches Bundesamt), GENESIS-Online; Data licence Germany - attribution - Version 2.0 (dl-de/by-2-0); copied, not live',
+    refresh_live: { tool: 'destatis_table', arguments: { table_code: h.table_code, ...h.filters } },
+  }));
+  return {
+    found: true,
+    term,
+    matched_via: 'curated_index',
+    ...(figures.length ? { figures } : {}),
+    topics: ranked.map((r) => r.topic.id),
+    matches: Math.min(tables.length, count),
+    source: 'Destatis, GENESIS table catalogue',
+    data_as_of: INDEX_AS_OF,
+    note: 'Table codes answered from a curated topic index, not a live title search (GENESIS title search is too slow for sentence-style questions). Pass a code to destatis_table to fetch its data. Titles are as GENESIS gave them on data_as_of; the index lists the main tables for each topic, not every table.',
+    tables: tables.slice(0, count),
+  };
+}
+
+// GENESIS hangs on full sentences (measured 2026-10-27: a 12-word question ran past
+// 14s every time, while its one content word answers in seconds). For a long term
+// the live ladder gets the longest content word instead of the sentence.
+const STOPWORDS = new Set('wie hoch war der die das den dem des im in am an auf laut nach von vom fuer für und oder ist sind wurde wurden ein eine einer eines wieviel viel viele was wer wo wann welche welcher statistischen statistischem bundesamt bundesamtes destatis deutschland deutschen jahr jahre the of for in a is what how much many was were according to by germany german federal statistical office'.split(' '));
+function liveTerm(t: string): string {
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length <= 3) return t;
+  const content = words.map((w) => w.replace(/[?!.,;:()"']/g, '')).filter((w) => w && !STOPWORDS.has(w.toLowerCase()) && !/^\d+$/.test(w));
+  if (content.length === 0) return t;
+  return content.sort((a, b) => b.length - a.length)[0]!;
+}
+
 async function search(token: string, term: string, limit?: number) {
   const t = String(term ?? '').trim();
   if (!t) throw new Error('Required argument "term" is missing (e.g. "population" or "Bevölkerung").');
   const count = Math.min(50, Math.max(1, limit ?? 15));
+  const indexed = lookupIndex(t, count);
+  if (indexed) return indexed;
   const started = Date.now();
   const remaining = () => SEARCH_BUDGET_MS - (Date.now() - started);
   // One budgeted, sequential GENESIS call. Code 6 (shared-token parallel limit,
@@ -1082,19 +1175,20 @@ async function search(token: string, term: string, limit?: number) {
     }
     return null;
   };
-  const de: Array<{ language: string; term: string }> = [{ language: 'de', term: t }];
-  const av = asciiVariant(t);
-  if (av !== t) de.push({ language: 'de', term: av });
-  const uv = umlautVariant(t);
-  if (uv !== t) de.push({ language: 'de', term: uv });
-  const en = { language: 'en', term: t };
+  const lt = liveTerm(t);
+  const de: Array<{ language: string; term: string }> = [{ language: 'de', term: lt }];
+  const av = asciiVariant(lt);
+  if (av !== lt) de.push({ language: 'de', term: av });
+  const uv = umlautVariant(lt);
+  if (uv !== lt) de.push({ language: 'de', term: uv });
+  const en = { language: 'en', term: lt };
   // Default order is the original ladder: en, de as typed, ascii, umlaut-restored.
-  const attempts = looksGerman(t) ? [...de, en] : [en, ...de];
+  const attempts = looksGerman(lt) ? [...de, en] : [en, ...de];
   const tried: string[] = [];
   let exhausted = false;
   for (const a of attempts) {
     const data = await budgeted('/find/find', { term: a.term, category: 'tables', pagelength: String(count) }, a.language);
-    const label = a.language === 'en' ? 'en' : `de${a.term === t ? '' : ` ("${a.term}")`}`;
+    const label = a.language === 'en' ? 'en' : `de${a.term === lt ? '' : ` ("${a.term}")`}`;
     if (!data) {
       // The budget is spent (the call that was in flight timed out). Not a confirmed miss.
       exhausted = true;
@@ -1121,7 +1215,7 @@ async function search(token: string, term: string, limit?: number) {
   let cut = false;
   for (const lang of remaining() < MIN_CALL_MS ? [] : ['de', 'en']) {
     try {
-      const sd = await budgeted('/find/find', { term: t, category: 'statistics', pagelength: '5' }, lang);
+      const sd = await budgeted('/find/find', { term: lt, category: 'statistics', pagelength: '5' }, lang);
       if (!sd) { exhausted = cut = true; break; }
       const stats = (sd.Statistics as GenTable[]) ?? [];
       const out: Array<{ code: string | null; title: string | null }> = [];
@@ -1170,19 +1264,44 @@ async function search(token: string, term: string, limit?: number) {
   };
 }
 
-async function table(token: string, tableCode: string) {
+const AREAS = new Set(['free', 'public', 'all', 'user']);
+const KEY_RE = /^[A-Za-z0-9_.,:\-]{1,200}$/;
+
+async function table(token: string, tableCode: string, opt: Record<string, unknown> = {}) {
   const code = String(tableCode ?? '').trim();
   if (!code) throw new Error('Required argument "table_code" is missing (e.g. "12411-0001"). Find codes with destatis_search.');
-  const data = await genesisPost(token, '/data/table', {
-    name: code,
-    area: 'free',
-    format: 'json',
-    compress: 'false',
-  });
+  const area = opt.area ? String(opt.area) : 'free';
+  if (!AREAS.has(area)) throw new Error(`area must be one of ${[...AREAS].join(', ')}.`);
+  if (opt.structure === true) {
+    // One sequential call, generous timeout: GENESIS has been seen to take >20s.
+    const meta = await genesisPost(token, '/metadata/table', { name: code, area }, 'en', 40_000);
+    return {
+      table_code: code,
+      source: 'Destatis GENESIS',
+      structure: meta.Object ?? meta,
+      status: (meta.Status as { Content?: string } | undefined)?.Content ?? null,
+    };
+  }
+  const params: Record<string, string> = { name: code, area, format: 'json', compress: 'false' };
+  const applied: Record<string, string> = {};
+  const map: Array<[string, string]> = [
+    ['classifying_variable1', 'classifyingvariable1'], ['classifying_variable2', 'classifyingvariable2'], ['classifying_variable3', 'classifyingvariable3'],
+    ['classifying_key1', 'classifyingkey1'], ['classifying_key2', 'classifyingkey2'], ['classifying_key3', 'classifyingkey3'],
+    ['start_year', 'startyear'], ['end_year', 'endyear'],
+  ];
+  for (const [arg, key] of map) {
+    const v = opt[arg];
+    if (v === undefined || v === null || String(v).trim() === '') continue;
+    const sv = String(v).trim();
+    if (!KEY_RE.test(sv)) throw new Error(`Argument "${arg}" has unsupported characters.`);
+    params[key] = sv; applied[arg] = sv;
+  }
+  const filtered = Object.keys(applied).length > 0;
+  const data = await genesisPost(token, '/data/table', params, 'en', filtered ? 40_000 : undefined);
   const status = (data.Status as { Content?: string } | undefined)?.Content;
   const obj = (data.Object as { Content?: string; Structure?: unknown } | undefined) ?? {};
   if (!obj.Content) {
-    return { table_code: code, error: 'no_data', status: status ?? null, message: `No data returned for table "${code}". Check the code via destatis_search.` };
+    return { table_code: code, error: 'no_data', status: status ?? null, filters: applied, message: `No data returned for table "${code}"${filtered ? ' with these filters' : ''}. Check the code via destatis_search, or the keys via structure:true.` };
   }
   // GENESIS returns the table as a flatfile-style text block in Content.
   const content = obj.Content;
@@ -1191,7 +1310,8 @@ async function table(token: string, tableCode: string) {
     table_code: code,
     title: firstLine.replace(/^Tabelle:\s*/, '').trim() || null,
     status: status ?? null,
-    source: 'Destatis GENESIS',
+    source: 'Destatis (Statistisches Bundesamt), GENESIS-Online; Data licence Germany - attribution - Version 2.0 (dl-de/by-2-0)',
+    ...(filtered ? { filters: applied } : {}),
     data: content,
   };
 }
@@ -1205,7 +1325,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case 'destatis_search':
       return search(token, (args.term ?? args.query) as string, args.limit as number | undefined);
     case 'destatis_table':
-      return table(token, args.table_code as string);
+      return table(token, args.table_code as string, args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
